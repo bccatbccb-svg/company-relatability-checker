@@ -1,0 +1,17 @@
+{
+  "name": "website-service-analyzer",
+  "version": "1.0.0",
+  "description": "Analyzes company websites to identify primary services and match against target categories",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "start": "node main.js"
+  },
+  "dependencies": {
+    "apify": "^3.0.0",
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12"
+  },
+  "author": "",
+  "license": "ISC"
+}
