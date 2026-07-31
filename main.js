@@ -15,9 +15,9 @@
  * Outputs: Relevance score, matched keywords, confidence level, recommendation, detailed logs
  */
 
-const Apify = require('apify');
-const axios = require('axios');
-const cheerio = require('cheerio');
+import { Actor } from 'apify';
+import axios from 'axios';
+import * as cheerio from 'cheerio';
 
 // Keyword dictionaries for identifying primary service
 const KEYWORDS = {
@@ -376,121 +376,123 @@ function analyzeServiceFit(pages, company) {
 /**
  * Main actor logic
  */
-Apify.main(async () => {
-  const input = await Apify.getInput();
-  console.log('Input:', JSON.stringify(input, null, 2));
+await Actor.init();
 
-  // Get URLs from input
-  const urls = input?.urls || [];
-  if (!Array.isArray(urls) || urls.length === 0) {
-    throw new Error('No URLs provided. Input should contain "urls" array.');
-  }
+const input = await Actor.getInput();
+console.log('Input:', JSON.stringify(input, null, 2));
 
-  // Open datasets to push results
-  const dataset = await Apify.openDataset('results');
-  const detailDataset = await Apify.openDataset('detail-logs');
+// Get URLs from input
+const urls = input?.urls || [];
+if (!Array.isArray(urls) || urls.length === 0) {
+  throw new Error('No URLs provided. Input should contain "urls" array.');
+}
 
-  let processedCount = 0;
+// Open datasets to push results
+const dataset = await Actor.openDataset('results');
+const detailDataset = await Actor.openDataset('detail-logs');
 
-  // Process each URL
-  for (let i = 0; i < urls.length; i++) {
-    const url = urls[i];
-    console.log(`\n[${i + 1}/${urls.length}] Processing: ${url}`);
+let processedCount = 0;
 
-    try {
-      // Fetch homepage
-      console.log('  → Fetching homepage...');
-      const homepageText = await extractPageContent(url, 'homepage');
-      
-      if (!homepageText) {
-        throw new Error('Could not fetch homepage');
-      }
+// Process each URL
+for (let i = 0; i < urls.length; i++) {
+  const url = urls[i];
+  console.log(`\n[${i + 1}/${urls.length}] Processing: ${url}`);
 
-      // Intelligently fetch About Us page
-      let aboutText = null;
-      const aboutUrl = await fetchAboutPage(url);
-      if (aboutUrl) {
-        console.log(`  → Found About page, fetching: ${aboutUrl}`);
-        aboutText = await extractPageContent(aboutUrl, 'about');
-      } else {
-        console.log('  → No About page found');
-      }
-
-      // Intelligently fetch Services page
-      let servicesText = null;
-      const servicesUrl = await fetchServicesPage(url);
-      if (servicesUrl) {
-        console.log(`  → Found Services page, fetching: ${servicesUrl}`);
-        servicesText = await extractPageContent(servicesUrl, 'services');
-      } else {
-        console.log('  → No Services page found');
-      }
-
-      // Analyze what their primary service is and if it fits BCC
-      const pages = {
-        homepage: homepageText,
-        about: aboutText,
-        services: servicesText,
-      };
-
-      const analysis = analyzeServiceFit(pages, url.split('/')[2]);
-
-      // Main result - columns for CSV
-      const result = {
-        url,
-        status: 'success',
-        recommendation: analysis.recommendation,
-        confidence: analysis.confidence,
-        servicesSummary: analysis.servicesSummary,
-        primaryServiceIdentified: analysis.primaryServiceIdentified,
-        targetCategoryMatch: analysis.targetCategoryMatch,
-        reasoning: analysis.reasoning,
-        windowCoveringsScore: analysis.scores.windowCoverings,
-        homeAutomationScore: analysis.scores.homeAutomation,
-        architectureScore: analysis.scores.architecture,
-        interiorDesignScore: analysis.scores.interiorDesign,
-        irrelevantScore: analysis.scores.irrelevant,
-        pagesAnalyzed: {
-          homepage: !!homepageText,
-          about: !!aboutText,
-          services: !!servicesText,
-        },
-        timestamp: new Date(),
-      };
-
-      await dataset.pushData(result);
-
-      // Detailed logs for iteration
-      const detailLog = {
-        url,
-        recommendation: analysis.recommendation,
-        primaryServiceIdentified: analysis.primaryServiceIdentified,
-        matchDetails: analysis.matchLog,
-        totalMatches: analysis.matchLog.length,
-        timestamp: new Date(),
-      };
-
-      await detailDataset.pushData(detailLog);
-
-      processedCount++;
-      console.log(`  ✅ ${analysis.recommendation}`);
-
-    } catch (error) {
-      console.error(`  ❌ Error: ${error.message}`);
-      
-      await dataset.pushData({
-        url,
-        status: 'error',
-        error: error.message,
-        timestamp: new Date(),
-      });
+  try {
+    // Fetch homepage
+    console.log('  → Fetching homepage...');
+    const homepageText = await extractPageContent(url, 'homepage');
+    
+    if (!homepageText) {
+      throw new Error('Could not fetch homepage');
     }
 
-    // Delay to avoid overwhelming servers
-    await new Promise(resolve => setTimeout(resolve, 1500));
+    // Intelligently fetch About Us page
+    let aboutText = null;
+    const aboutUrl = await fetchAboutPage(url);
+    if (aboutUrl) {
+      console.log(`  → Found About page, fetching: ${aboutUrl}`);
+      aboutText = await extractPageContent(aboutUrl, 'about');
+    } else {
+      console.log('  → No About page found');
+    }
+
+    // Intelligently fetch Services page
+    let servicesText = null;
+    const servicesUrl = await fetchServicesPage(url);
+    if (servicesUrl) {
+      console.log(`  → Found Services page, fetching: ${servicesUrl}`);
+      servicesText = await extractPageContent(servicesUrl, 'services');
+    } else {
+      console.log('  → No Services page found');
+    }
+
+    // Analyze what their primary service is and if it fits BCC
+    const pages = {
+      homepage: homepageText,
+      about: aboutText,
+      services: servicesText,
+    };
+
+    const analysis = analyzeServiceFit(pages, url.split('/')[2]);
+
+    // Main result - columns for CSV
+    const result = {
+      url,
+      status: 'success',
+      recommendation: analysis.recommendation,
+      confidence: analysis.confidence,
+      servicesSummary: analysis.servicesSummary,
+      primaryServiceIdentified: analysis.primaryServiceIdentified,
+      targetCategoryMatch: analysis.targetCategoryMatch,
+      reasoning: analysis.reasoning,
+      windowCoveringsScore: analysis.scores.windowCoverings,
+      homeAutomationScore: analysis.scores.homeAutomation,
+      architectureScore: analysis.scores.architecture,
+      interiorDesignScore: analysis.scores.interiorDesign,
+      irrelevantScore: analysis.scores.irrelevant,
+      pagesAnalyzed: {
+        homepage: !!homepageText,
+        about: !!aboutText,
+        services: !!servicesText,
+      },
+      timestamp: new Date(),
+    };
+
+    await dataset.pushData(result);
+
+    // Detailed logs for iteration
+    const detailLog = {
+      url,
+      recommendation: analysis.recommendation,
+      primaryServiceIdentified: analysis.primaryServiceIdentified,
+      matchDetails: analysis.matchLog,
+      totalMatches: analysis.matchLog.length,
+      timestamp: new Date(),
+    };
+
+    await detailDataset.pushData(detailLog);
+
+    processedCount++;
+    console.log(`  ✅ ${analysis.recommendation}`);
+
+  } catch (error) {
+    console.error(`  ❌ Error: ${error.message}`);
+    
+    await dataset.pushData({
+      url,
+      status: 'error',
+      error: error.message,
+      timestamp: new Date(),
+    });
   }
 
-  console.log(`\n✅ Completed analysis of ${processedCount}/${urls.length} URLs`);
-  console.log(`Results saved to 'results' dataset`);
-  console.log(`Detailed match logs saved to 'detail-logs' dataset`);
-});
+  // Delay to avoid overwhelming servers
+  await new Promise(resolve => setTimeout(resolve, 1500));
+}
+
+console.log(`\n✅ Completed analysis of ${processedCount}/${urls.length} URLs`);
+console.log(`Results saved to 'results' dataset`);
+console.log(`Detailed match logs saved to 'detail-logs' dataset`);
+
+await Actor.exit();
