@@ -247,7 +247,7 @@ async function generateGeminiSummary(cleanedText, geminiApiKey) {
   
   try {
     const genAI = new GoogleGenerativeAI(geminiApiKey);
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    const model = genAI.getGenerativeModel({ model: 'gemini-3.5-flash' });
     
     const prompt = `Based on the following website text, provide a brief 1-2 sentence summary of what services or products this company primarily offers. Focus only on their main business, not side offerings. Be concise and professional.
 
