@@ -15,7 +15,7 @@
  * Outputs: Relevance score, matched keywords, confidence level, recommendation, detailed logs
  */
 
-import Apify from 'apify';
+import { Actor } from 'apify';
 import axios from 'axios';
 import cheerio from 'cheerio';
 import { GoogleGenerativeAI } from '@google/generative-ai';
@@ -460,8 +460,8 @@ async function analyzeServiceFit(pages, company, url, geminiApiKey) {
 /**
  * Main actor logic
  */
-Apify.main(async () => {
-  const input = await Apify.getInput();
+Actor.main(async () => {
+  const input = await Actor.getInput();
   console.log('Input:', JSON.stringify(input, null, 2));
 
   // Get URLs and Gemini API key from input
@@ -477,8 +477,8 @@ Apify.main(async () => {
   }
 
   // Open datasets to push results
-  const dataset = await Apify.openDataset('results');
-  const detailDataset = await Apify.openDataset('detail-logs');
+  const dataset = await Actor.openDataset('results');
+  const detailDataset = await Actor.openDataset('detail-logs');
 
   let processedCount = 0;
 
