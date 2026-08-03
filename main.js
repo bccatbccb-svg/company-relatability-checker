@@ -242,10 +242,12 @@ async function generateGeminiSummary(cleanedText, geminiApiKey) {
   }
   
   if (!geminiApiKey) {
+    console.warn('⚠️  No Gemini API key provided - skipping Gemini summary');
     return 'Gemini API key not provided';
   }
   
   try {
+    console.log('✓ Calling Gemini API with model gemini-3.5-flash');
     const genAI = new GoogleGenerativeAI(geminiApiKey);
     const model = genAI.getGenerativeModel({ model: 'gemini-3.5-flash' });
     
@@ -259,6 +261,8 @@ Summary (1-2 sentences only):`;
     const result = await model.generateContent(prompt);
     const responseText = result.response.text();
     
+    console.log('✓ Gemini response received');
+    
     // Clean up response - remove quotes or extra formatting
     let summary = responseText.trim();
     summary = summary.replace(/^["']|["']$/g, '');
@@ -270,8 +274,8 @@ Summary (1-2 sentences only):`;
     
     return summary;
   } catch (error) {
-    console.error('Gemini API error:', error.message);
-    return 'Unable to generate summary';
+    console.error('❌ Gemini API error:', error.message);
+    return `Error: ${error.message}`;
   }
 }
 
@@ -473,7 +477,9 @@ Actor.main(async () => {
   }
   
   if (!geminiApiKey) {
-    console.warn('⚠️  WARNING: No Gemini API key provided. Summaries will be limited.');
+    console.warn('⚠️  WARNING: No Gemini API key provided. Summaries will use fallback.');
+  } else {
+    console.log('✓ Gemini API key received - summaries will be generated');
   }
 
   // Open datasets to push results
