@@ -280,13 +280,92 @@ Summary (1-2 sentences only):`;
 }
 
 /**
+ * Fallback: Query Gemini about company using just URL/domain name
+ */
+async function queryGeminiFallback(url, geminiApiKey) {
+  if (!geminiApiKey) {
+    return null;
+  }
+  
+  try {
+    console.log(`  → Fallback: Querying Gemini about ${url}`);
+    const genAI = new GoogleGenerativeAI(geminiApiKey);
+    const model = genAI.getGenerativeModel({ model: 'gemini-3.5-flash' });
+    
+    const domain = url.replace(/https?:\/\/(www\.)?/, '').split('/')[0];
+    
+    const prompt = `Based on your knowledge, what is the primary business or services of the company at ${domain}? Provide a brief 1-2 sentence summary of what they do. If you don't have information about this company, say so directly.`;
+    
+    const result = await model.generateContent(prompt);
+    const responseText = result.response.text();
+    
+    let summary = responseText.trim();
+    summary = summary.replace(/^["']|["']$/g, '');
+    
+    if (summary.length > 300) {
+      summary = summary.substring(0, 300).trim() + '...';
+    }
+    
+    console.log(`  ✓ Fallback response: ${summary.substring(0, 80)}...`);
+    return summary;
+  } catch (error) {
+    console.error(`  ❌ Fallback query failed:`, error.message);
+    return null;
+  }
+}
+
+/**
+ * Verification: Ask Gemini to validate our keyword findings
+ */
+async function verifyWithGemini(analysis, pages, url, geminiApiKey) {
+  if (!geminiApiKey) {
+    return null;
+  }
+  
+  try {
+    console.log(`  → Verification: Asking Gemini to confirm our analysis`);
+    const genAI = new GoogleGenerativeAI(geminiApiKey);
+    const model = genAI.getGenerativeModel({ model: 'gemini-3.5-flash' });
+    
+    const textToAnalyze = pages.about || pages.services || pages.homepage || '';
+    const cleanedText = cleanPageText(textToAnalyze).substring(0, 1000);
+    
+    const prompt = `Based on the following website text about a company, determine their PRIMARY service category. Choose ONE: 
+    1. Window coverings/treatments
+    2. Home automation/smart home
+    3. Architecture
+    4. Interior design
+    5. None of the above
+    
+Website text:
+${cleanedText}
+
+What is their PRIMARY service? Answer with just the category name and 1 sentence explaining why.`;
+    
+    const result = await model.generateContent(prompt);
+    const responseText = result.response.text();
+    
+    console.log(`  ✓ Verification response: ${responseText.substring(0, 80)}...`);
+    return responseText.trim();
+  } catch (error) {
+    console.error(`  ❌ Verification failed:`, error.message);
+    return null;
+  }
+}
+
+/**
  * Extract a brief summary of company services from content
  */
-async function extractServicesSummary(pages, geminiApiKey) {
+async function extractServicesSummary(pages, geminiApiKey, url) {
   // Prioritize About Us, then Services, then Homepage
   const textToAnalyze = pages.about || pages.services || pages.homepage || '';
   
-  if (!textToAnalyze) return 'Unable to determine services';
+  // If no content found, use Gemini as fallback
+  if (!textToAnalyze) {
+    console.log(`  ⚠️  No page content found - using Gemini fallback`);
+    const fallbackSummary = await queryGeminiFallback(url, geminiApiKey);
+    return fallbackSummary || 'Unable to determine services';
+  }
   
   // Clean the text first (remove nav, social, junk)
   const cleanedText = cleanPageText(textToAnalyze);
@@ -339,7 +418,13 @@ async function analyzeServiceFit(pages, company, url, geminiApiKey) {
   let matchLog = [];
   let primaryServiceCategory = null;
   let primaryServiceKeyword = null;
-  let servicesSummary = await extractServicesSummary(pages, geminiApiKey);
+  let servicesSummary = await extractServicesSummary(pages, geminiApiKey, url);
+  
+  // Verification: Ask Gemini to validate our findings
+  let geminiVerification = null;
+  if (pages.homepage || pages.about || pages.services) {
+    geminiVerification = await verifyWithGemini(null, pages, url, geminiApiKey);
+  }
 
   // Process each page with different weights
   const pageWeights = {
@@ -499,7 +584,7 @@ Actor.main(async () => {
       const homepageText = await extractPageContent(url, 'homepage');
       
       if (!homepageText) {
-        throw new Error('Could not fetch homepage');
+        console.warn('  ⚠️  Could not fetch homepage, will try about/services pages');
       }
 
       // Intelligently fetch About Us page
@@ -522,12 +607,17 @@ Actor.main(async () => {
         console.log('  → No Services page found');
       }
 
-      // Analyze what their primary service is and if it fits BCC
+      // Check if we have ANY content at all
       const pages = {
         homepage: homepageText,
         about: aboutText,
         services: servicesText,
       };
+      
+      const hasAnyContent = homepageText || aboutText || servicesText;
+      if (!hasAnyContent) {
+        throw new Error('Could not fetch any content from website');
+      }
 
       const analysis = await analyzeServiceFit(pages, url.split('/')[2], url, geminiApiKey);
 
@@ -551,6 +641,7 @@ Actor.main(async () => {
           about: !!aboutText,
           services: !!servicesText,
         },
+        geminiVerification: geminiVerification || 'No verification performed',
         timestamp: new Date(),
       };
 
@@ -563,6 +654,7 @@ Actor.main(async () => {
         primaryServiceIdentified: analysis.primaryServiceIdentified,
         matchDetails: analysis.matchLog,
         totalMatches: analysis.matchLog.length,
+        geminiVerification: geminiVerification || 'No verification performed',
         timestamp: new Date(),
       };
 
