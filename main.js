@@ -534,6 +534,7 @@ async function analyzeServiceFit(pages, company, url, geminiApiKey) {
     primaryServiceIdentified: primaryServiceCategory ? `${primaryServiceCategory}: ${primaryServiceKeyword}` : 'Unclear',
     targetCategoryMatch: targetCategoryMatch || 'None',
     servicesSummary,
+    geminiVerification,
     reasoning,
     scores: {
       windowCoverings: scores.windowCoverings.weight,
@@ -641,7 +642,7 @@ Actor.main(async () => {
           about: !!aboutText,
           services: !!servicesText,
         },
-        geminiVerification: geminiVerification || 'No verification performed',
+        geminiVerification: analysis.geminiVerification || 'No verification performed',
         timestamp: new Date(),
       };
 
@@ -654,7 +655,7 @@ Actor.main(async () => {
         primaryServiceIdentified: analysis.primaryServiceIdentified,
         matchDetails: analysis.matchLog,
         totalMatches: analysis.matchLog.length,
-        geminiVerification: geminiVerification || 'No verification performed',
+        geminiVerification: analysis.geminiVerification || 'No verification performed',
         timestamp: new Date(),
       };
 
