@@ -15,10 +15,10 @@
  * Outputs: Relevance score, matched keywords, confidence level, recommendation, detailed logs
  */
 
-const Apify = require('apify');
-const axios = require('axios');
-const cheerio = require('cheerio');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+import Apify from 'apify';
+import axios from 'axios';
+import cheerio from 'cheerio';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 // Keyword dictionaries for identifying primary service
 const KEYWORDS = {
