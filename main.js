@@ -1,17 +1,21 @@
 /**
  * Custom Apify Actor: Relevance Scorer for Window Coverings / Home Automation / Architecture
- * 
+ *
  * Analyzes company websites to determine if they work with:
  * - Window coverings (blinds, shades, shutters, etc.)
  * - Home automation / smart home
  * - Residential architecture / interior design
- * 
+ *
  * KEY FEATURES:
  * - Fetches multiple pages (homepage, about us, services) with intelligent URL detection
  * - Position-weighted scoring (primary service = higher weight)
  * - Detects secondary services ("also offer", "in addition to", etc.)
+ * - Meta tag & title extraction (fallback content for text-light sites)
+ * - Schema.org/JSON-LD extraction (structured data, invisible on rendered page)
+ * - Portfolio-site detection with confidence boost (image-heavy / gallery sites)
+ * - Context-aware Gemini prompts (different prompt when text is sparse/portfolio-style)
  * - Detailed logging for iteration and tuning
- * 
+ *
  * Outputs: Relevance score, matched keywords, confidence level, recommendation, detailed logs
  */
 
@@ -30,19 +34,19 @@ const KEYWORDS = {
     'motorized blind', 'automated window treatment', 'window shade',
     'hunter douglas', 'lutron shades', 'somfy', 'pella', 'graber', 'levolor',
   ],
-  
+
   homeAutomation: [
     'home automation', 'smart home', 'home automation system', 'smart control', 'voice control',
     'smart integration', 'home automation design', 'connected home', 'smart home integration',
     'automated lighting', 'smart thermostat', 'smart door', 'home connectivity',
     'lutron', 'control4', 'savant', 'crestron', 'elan',
   ],
-  
+
   architecture: [
     'architect', 'architecture', 'architecture firm', 'architectural design', 'architectural services',
     'architectural firm', 'building design', 'design architecture', 'residential architect',
   ],
-  
+
   interiorDesign: [
     'interior design', 'interior designer', 'interior designer', 'interior decorator',
     'interior decoration', 'interior styling', 'residential interiors', 'home interior design',
@@ -56,35 +60,31 @@ const KEYWORDS = {
     'contractor services', 'roofing', 'framing', 'drywall', 'painting contractor',
     'plumbing', 'electrical contractor', 'hvac', 'structural engineer', 'engineering',
     'concrete contractor', 'masonry', 'carpentry',
-    
+
     // Land/Planning
     'land planning', 'land developer', 'development company', 'real estate development',
     'regulatory compliance', 'permitting', 'permit services', 'land surveying',
     'environmental consulting',
-    
+
     // Retail/Commercial
     'furniture store', 'furniture retailer', 'furniture company', 'flooring retailer',
     'flooring company', 'tile company', 'carpet', 'appliance store', 'window replacement',
     'retail store', 'furniture gallery', 'home furnishings',
-    
+
     // Hospitality/Commercial
     'hospitality', 'hotel design', 'restaurant design', 'commercial contractor',
     'office furniture', 'corporate design', 'retail design', 'commercial kitchen',
-    
+
     // Home Services
     'home services', 'home maintenance', 'cleaning service', 'landscaping', 'lawn care',
     'painting service', 'repair service', 'maintenance service',
   ],
 };
 
-
-
 /**
  * Intelligently fetch About Us page
- * Tries URL patterns first, then falls back to link detection
  */
 async function fetchAboutPage(baseUrl) {
-  // URL patterns to try
   const patterns = [
     '/about',
     '/about-us',
@@ -95,7 +95,6 @@ async function fetchAboutPage(baseUrl) {
     '/about-our-firm',
   ];
 
-  // Try URL patterns first (fast)
   for (const pattern of patterns) {
     try {
       const testUrl = new URL(baseUrl).origin + pattern;
@@ -111,7 +110,6 @@ async function fetchAboutPage(baseUrl) {
     }
   }
 
-  // Fall back to link text detection (slower but catches custom URLs)
   try {
     const response = await axios.get(baseUrl, {
       timeout: 8000,
@@ -120,15 +118,14 @@ async function fetchAboutPage(baseUrl) {
 
     const $ = cheerio.load(response.data);
     const links = $('a');
-    
+
     for (let i = 0; i < links.length; i++) {
       const text = $(links[i]).text().toLowerCase();
       const href = $(links[i]).attr('href');
-      
+
       if (href && (text.includes('about') || text.includes('who we are') || text.includes('our firm'))) {
         try {
           const aboutUrl = new URL(href, baseUrl).href;
-          // Verify it's on same domain
           if (new URL(aboutUrl).origin === new URL(baseUrl).origin) {
             return aboutUrl;
           }
@@ -176,8 +173,102 @@ async function fetchServicesPage(baseUrl) {
 }
 
 /**
- * Extract text from webpage with better section detection
+ * Extract meta title & description from <head>
+ */
+function extractMetaTags($) {
+  const metaTitle = $('title').first().text().trim() || null;
+
+  let metaDescription =
+    $('meta[name="description"]').attr('content') ||
+    $('meta[property="og:description"]').attr('content') ||
+    $('meta[name="twitter:description"]').attr('content') ||
+    null;
+
+  metaDescription = metaDescription ? metaDescription.trim() : null;
+
+  const ogTitle = $('meta[property="og:title"]').attr('content');
+
+  return {
+    metaTitle: metaTitle || (ogTitle ? ogTitle.trim() : null),
+    metaDescription,
+  };
+}
+
+/**
+ * Extract Schema.org / JSON-LD structured data from <script type="application/ld+json"> blocks.
+ * Sites often embed serviceType / description / areaServed here even when the
+ * rendered page is 100% images.
+ */
+function extractSchemaData($) {
+  const scripts = $('script[type="application/ld+json"]');
+  const collected = [];
+
+  scripts.each((i, el) => {
+    const raw = $(el).contents().text();
+    if (!raw || !raw.trim()) return;
+
+    try {
+      const parsed = JSON.parse(raw);
+      const items = Array.isArray(parsed) ? parsed : [parsed];
+
+      items.forEach((item) => {
+        // Some sites nest relevant data under @graph
+        const graphItems = Array.isArray(item['@graph']) ? item['@graph'] : [item];
+
+        graphItems.forEach((entry) => {
+          if (!entry || typeof entry !== 'object') return;
+
+          const relevant = {
+            type: entry['@type'] || null,
+            name: entry.name || null,
+            description: entry.description || null,
+            serviceType: entry.serviceType || null,
+            areaServed: entry.areaServed || null,
+            knowsAbout: entry.knowsAbout || null,
+          };
+
+          // Only keep entries that actually contain useful signal
+          if (relevant.description || relevant.serviceType || relevant.knowsAbout || relevant.name) {
+            collected.push(relevant);
+          }
+        });
+      });
+    } catch (e) {
+      // Malformed JSON-LD - skip silently, don't break extraction
+    }
+  });
+
+  return collected.length > 0 ? collected : null;
+}
+
+/**
+ * Detect portfolio/gallery-heavy structure so we don't penalize sites
+ * for having little body text when that's expected for their category.
+ */
+function detectPortfolioSignals($, textLength) {
+  const imageCount = $('img').length;
+  const galleryElements = $('[class*="gallery"], [class*="portfolio"], [id*="gallery"], [id*="portfolio"]').length;
+
+  // Avoid divide-by-zero; treat near-empty text as a large ratio
+  const safeTextLength = Math.max(textLength, 1);
+  const imageToTextRatio = imageCount / (safeTextLength / 100);
+
+  const isPortfolioSite = imageCount >= 8 && (galleryElements > 0 || imageToTextRatio > 2.0) && textLength < 800;
+
+  return {
+    imageCount,
+    galleryElements,
+    imageToTextRatio: Math.round(imageToTextRatio * 10) / 10,
+    isPortfolioSite,
+  };
+}
+
+/**
+ * Extract text + metadata from webpage with better section detection
  * Depth: 3500-4000 characters per page
+ *
+ * Returns an object instead of a plain string so callers have access to
+ * meta tags, schema data, and portfolio signals alongside the body text.
  */
 async function extractPageContent(url, pageType = 'homepage') {
   try {
@@ -187,15 +278,27 @@ async function extractPageContent(url, pageType = 'homepage') {
     });
 
     const $ = cheerio.load(response.data);
-    
-    // Remove noise
+
+    // Extract head-level signals BEFORE stripping anything
+    const { metaTitle, metaDescription } = extractMetaTags($);
+    const schemaData = extractSchemaData($);
+
+    // Remove noise for body text extraction
     $('script, style, nav, footer, .nav, .navigation, .sidebar, .widget').remove();
 
-    // Get main body text
-    const text = $('body').text();
-    
-    // Return first 3500 chars (roughly 600 words)
-    return text.substring(0, 3500).trim();
+    const text = $('body').text().replace(/\s+/g, ' ').trim();
+    const bodyText = text.substring(0, 3500).trim();
+
+    const portfolioSignals = detectPortfolioSignals($, text.length);
+
+    return {
+      bodyText,
+      metaTitle,
+      metaDescription,
+      schemaData,
+      ...portfolioSignals,
+      fetchError: null,
+    };
   } catch (error) {
     console.error(`Error fetching ${url}: ${error.message}`);
     return null;
@@ -207,76 +310,99 @@ async function extractPageContent(url, pageType = 'homepage') {
  */
 function cleanPageText(text) {
   if (!text || text.length < 50) return '';
-  
+
   let cleaned = text;
-  
-  // Remove script and style tags content
-  // (Already done by cheerio in extractPageContent, but be safe)
-  
-  // Remove common nav/menu items (be less aggressive - only exact matches)
+
   cleaned = cleaned.replace(/\b(menu|nav|navigation|instagram|linkedin|twitter|facebook|youtube|contact us|follow us)\b/gi, '');
-  
-  // Remove URLs
   cleaned = cleaned.replace(/https?:\/\/[^\s]+/g, '');
   cleaned = cleaned.replace(/www\.[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '');
-  
-  // Remove emails
   cleaned = cleaned.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '');
-  
-  // Remove phone-like patterns (but not years)
   cleaned = cleaned.replace(/\(?[0-9]{3}[-.]?[0-9]{3}[-.]?[0-9]{4}\)?/g, '');
-  
-  // Remove extra whitespace
   cleaned = cleaned.replace(/\s+/g, ' ').trim();
-  
-  // Keep only first 1500 characters of cleaned text
+
   return cleaned.substring(0, 1500);
+}
+
+/**
+ * Flatten schema.org entries into a short readable string for prompts/logging.
+ */
+function formatSchemaForPrompt(schemaData) {
+  if (!schemaData || schemaData.length === 0) return null;
+
+  return schemaData
+    .map((entry) => {
+      const parts = [];
+      if (entry.type) parts.push(`Type: ${entry.type}`);
+      if (entry.name) parts.push(`Name: ${entry.name}`);
+      if (entry.serviceType) parts.push(`Service: ${entry.serviceType}`);
+      if (entry.description) parts.push(`Description: ${entry.description}`);
+      if (entry.areaServed) parts.push(`Area served: ${JSON.stringify(entry.areaServed)}`);
+      if (entry.knowsAbout) parts.push(`Knows about: ${JSON.stringify(entry.knowsAbout)}`);
+      return parts.join(' | ');
+    })
+    .filter(Boolean)
+    .join('\n');
 }
 
 /**
  * Generate summary using Gemini API
  */
-async function generateGeminiSummary(cleanedText, geminiApiKey) {
-  if (!cleanedText || cleanedText.length < 30) {
-    console.log('    ⚠️  Cleaned text too short for Gemini, using fallback');
+async function generateGeminiSummary(cleanedText, geminiApiKey, supplementalContext = {}) {
+  const { metaDescription, schemaSummary, isPortfolioSite } = supplementalContext;
+
+  const hasSupplemental = metaDescription || schemaSummary;
+
+  if ((!cleanedText || cleanedText.length < 30) && !hasSupplemental) {
+    console.log('    ⚠️  No usable content (body/meta/schema) for Gemini, using fallback');
     return 'Unable to determine services';
   }
-  
+
   if (!geminiApiKey) {
     console.log('    ⚠️  No Gemini API key - skipping summary');
     return 'Gemini API key not provided';
   }
-  
+
   try {
     console.log('    → Calling Gemini for summary...');
     const genAI = new GoogleGenerativeAI(geminiApiKey);
     const model = genAI.getGenerativeModel({ model: 'gemini-3.5-flash' });
-    
-    const prompt = `Based on the following website text, provide a brief 1-2 sentence summary of what services or products this company primarily offers. Focus only on their main business, not side offerings. Be concise and professional.
+
+    let prompt;
+
+    if (isPortfolioSite || (cleanedText.length < 150 && hasSupplemental)) {
+      prompt = `This is a portfolio/gallery-style website with minimal body text (common for architecture and design firms). Use ALL signals below to summarize what the company primarily offers.
+
+Meta description: ${metaDescription || 'none found'}
+Structured data (schema.org): ${schemaSummary || 'none found'}
+Available page text: ${cleanedText || 'minimal/none'}
+
+Provide a brief 1-2 sentence summary of what services or products this company primarily offers. Focus only on their main business, not side offerings. Be concise and professional.
+
+Summary (1-2 sentences only):`;
+    } else {
+      prompt = `Based on the following website text, provide a brief 1-2 sentence summary of what services or products this company primarily offers. Focus only on their main business, not side offerings. Be concise and professional.
 
 Website text:
 ${cleanedText}
 
 Summary (1-2 sentences only):`;
-    
+    }
+
     const result = await model.generateContent(prompt);
     const responseText = result.response.text();
-    
+
     console.log('    ✓ Gemini summary generated');
-    
-    // Clean up response
+
     let summary = responseText.trim();
     summary = summary.replace(/^["']|["']$/g, '');
-    
-    // Cap at 300 characters
+
     if (summary.length > 300) {
       summary = summary.substring(0, 300).trim() + '...';
     }
-    
+
     return summary;
   } catch (error) {
     console.error('    ❌ Gemini summary error:', error.message);
-    // Return a marker string so we can see this happened
     return `[Gemini Error: ${error.message.substring(0, 50)}]`;
   }
 }
@@ -288,26 +414,26 @@ async function queryGeminiFallback(url, geminiApiKey) {
   if (!geminiApiKey) {
     return null;
   }
-  
+
   try {
     console.log(`  → Fallback: Querying Gemini about ${url}`);
     const genAI = new GoogleGenerativeAI(geminiApiKey);
     const model = genAI.getGenerativeModel({ model: 'gemini-3.5-flash' });
-    
+
     const domain = url.replace(/https?:\/\/(www\.)?/, '').split('/')[0];
-    
+
     const prompt = `Based on your knowledge, what is the primary business or services of the company at ${domain}? Provide a brief 1-2 sentence summary of what they do. If you don't have information about this company, say so directly.`;
-    
+
     const result = await model.generateContent(prompt);
     const responseText = result.response.text();
-    
+
     let summary = responseText.trim();
     summary = summary.replace(/^["']|["']$/g, '');
-    
+
     if (summary.length > 300) {
       summary = summary.substring(0, 300).trim() + '...';
     }
-    
+
     console.log(`  ✓ Fallback response: ${summary.substring(0, 80)}...`);
     return summary;
   } catch (error) {
@@ -317,41 +443,94 @@ async function queryGeminiFallback(url, geminiApiKey) {
 }
 
 /**
- * Verification: Ask Gemini to validate our keyword findings
+ * Build the verification prompt, choosing a context-aware template when
+ * text is sparse / the site looks like a portfolio, and a standard
+ * template when there's plenty of body text to work with.
  */
-async function verifyWithGemini(analysis, pages, url, geminiApiKey) {
-  if (!geminiApiKey) {
-    return null;
+function buildVerificationPrompt(cleanedText, context) {
+  const { isPortfolioSite, metaTitle, metaDescription, schemaSummary, domain } = context;
+
+  const sparse = !cleanedText || cleanedText.length < 150;
+
+  if (isPortfolioSite || sparse) {
+    return `This appears to be a portfolio/gallery-heavy website with minimal body text (common for architecture and design firms who lead with visuals rather than copy).
+
+Domain: ${domain}
+Page title: ${metaTitle || 'none found'}
+Meta description: ${metaDescription || 'none found'}
+Structured data (schema.org): ${schemaSummary || 'none found'}
+Available page text: ${cleanedText || 'minimal/none'}
+
+Using ALL available signals above (not just body text), determine their PRIMARY service category. Choose ONE:
+1. Window coverings/treatments
+2. Home automation/smart home
+3. Architecture
+4. Interior design
+5. None of the above
+
+Answer with just the category name and 1 sentence explaining why, noting explicitly if your answer relies mainly on domain/meta/schema signals rather than page copy.`;
   }
-  
-  try {
-    console.log(`    → Calling Gemini for verification...`);
-    const genAI = new GoogleGenerativeAI(geminiApiKey);
-    const model = genAI.getGenerativeModel({ model: 'gemini-3.5-flash' });
-    
-    const textToAnalyze = pages.about || pages.services || pages.homepage || '';
-    const cleanedText = cleanPageText(textToAnalyze).substring(0, 1000);
-    
-    if (!cleanedText || cleanedText.length < 20) {
-      console.log(`    ⚠️  Not enough content for verification`);
-      return null;
-    }
-    
-    const prompt = `Based on the following website text about a company, determine their PRIMARY service category. Choose ONE: 
-    1. Window coverings/treatments
-    2. Home automation/smart home
-    3. Architecture
-    4. Interior design
-    5. None of the above
-    
+
+  return `Based on the following website text about a company, determine their PRIMARY service category. Choose ONE:
+1. Window coverings/treatments
+2. Home automation/smart home
+3. Architecture
+4. Interior design
+5. None of the above
+
 Website text:
 ${cleanedText}
 
 What is their PRIMARY service? Answer with just the category name and 1 sentence explaining why.`;
-    
+}
+
+/**
+ * Verification: Ask Gemini to validate our keyword findings
+ */
+async function verifyWithGemini(pages, url, geminiApiKey) {
+  if (!geminiApiKey) {
+    return null;
+  }
+
+  try {
+    console.log(`    → Calling Gemini for verification...`);
+    const genAI = new GoogleGenerativeAI(geminiApiKey);
+    const model = genAI.getGenerativeModel({ model: 'gemini-3.5-flash' });
+
+    const primaryPage = pages.about || pages.services || pages.homepage || null;
+    const textToAnalyze = primaryPage?.bodyText || '';
+    const cleanedText = cleanPageText(textToAnalyze).substring(0, 1000);
+
+    // Pull supplemental signals from whichever page has them (prefer homepage,
+    // since portfolio homepages are the primary case we're solving for)
+    const metaTitle = pages.homepage?.metaTitle || pages.about?.metaTitle || pages.services?.metaTitle || null;
+    const metaDescription =
+      pages.homepage?.metaDescription || pages.about?.metaDescription || pages.services?.metaDescription || null;
+    const schemaData = pages.homepage?.schemaData || pages.about?.schemaData || pages.services?.schemaData || null;
+    const schemaSummary = formatSchemaForPrompt(schemaData);
+
+    const isPortfolioSite = !!(pages.homepage?.isPortfolioSite || pages.about?.isPortfolioSite || pages.services?.isPortfolioSite);
+
+    const hasSupplemental = metaDescription || schemaSummary;
+
+    if ((!cleanedText || cleanedText.length < 20) && !hasSupplemental) {
+      console.log(`    ⚠️  Not enough content for verification`);
+      return null;
+    }
+
+    const domain = url.replace(/https?:\/\/(www\.)?/, '').split('/')[0];
+
+    const prompt = buildVerificationPrompt(cleanedText, {
+      isPortfolioSite,
+      metaTitle,
+      metaDescription,
+      schemaSummary,
+      domain,
+    });
+
     const result = await model.generateContent(prompt);
     const responseText = result.response.text();
-    
+
     console.log(`    ✓ Gemini verification complete`);
     return responseText.trim();
   } catch (error) {
@@ -364,22 +543,29 @@ What is their PRIMARY service? Answer with just the category name and 1 sentence
  * Extract a brief summary of company services from content
  */
 async function extractServicesSummary(pages, geminiApiKey, url) {
-  // Prioritize About Us, then Services, then Homepage
-  const textToAnalyze = pages.about || pages.services || pages.homepage || '';
-  
-  // If no content found, use Gemini as fallback
-  if (!textToAnalyze) {
-    console.log(`  ⚠️  No page content found - using Gemini fallback`);
+  const primaryPage = pages.about || pages.services || pages.homepage || null;
+  const textToAnalyze = primaryPage?.bodyText || '';
+
+  const metaDescription =
+    pages.homepage?.metaDescription || pages.about?.metaDescription || pages.services?.metaDescription || null;
+  const schemaData = pages.homepage?.schemaData || pages.about?.schemaData || pages.services?.schemaData || null;
+  const schemaSummary = formatSchemaForPrompt(schemaData);
+  const isPortfolioSite = !!(pages.homepage?.isPortfolioSite || pages.about?.isPortfolioSite || pages.services?.isPortfolioSite);
+
+  if (!textToAnalyze && !metaDescription && !schemaSummary) {
+    console.log(`  ⚠️  No page content, meta, or schema found - using Gemini fallback`);
     const fallbackSummary = await queryGeminiFallback(url, geminiApiKey);
     return fallbackSummary || 'Unable to determine services';
   }
-  
-  // Clean the text first (remove nav, social, junk)
+
   const cleanedText = cleanPageText(textToAnalyze);
-  
-  // Use Gemini to generate summary
-  const summary = await generateGeminiSummary(cleanedText, geminiApiKey);
-  
+
+  const summary = await generateGeminiSummary(cleanedText, geminiApiKey, {
+    metaDescription,
+    schemaSummary,
+    isPortfolioSite,
+  });
+
   return summary;
 }
 
@@ -389,15 +575,14 @@ async function extractServicesSummary(pages, geminiApiKey, url) {
 function getDomainWeight(url) {
   const domain = url.toLowerCase();
   let domainWeight = 0;
-  
+
   if (domain.includes('architect')) {
     domainWeight += 25;
   }
   if (domain.includes('design') && domain.includes('arch')) {
-    // Only count "design" if clearly architecture-related
     domainWeight += 10;
   }
-  
+
   return domainWeight;
 }
 
@@ -405,8 +590,8 @@ function getDomainWeight(url) {
  * Identify primary service and match against 4 target categories
  */
 async function analyzeServiceFit(pages, company, url, geminiApiKey) {
-  // pages = { homepage: text, about: text, services: text }
-  
+  // pages = { homepage: {bodyText, metaTitle, metaDescription, schemaData, ...}, about: {...}, services: {...} }
+
   let scores = {
     windowCoverings: { matches: 0, weight: 0 },
     homeAutomation: { matches: 0, weight: 0 },
@@ -415,27 +600,38 @@ async function analyzeServiceFit(pages, company, url, geminiApiKey) {
     irrelevant: { matches: 0, weight: 0 },
   };
 
-  // Add domain-based weight for architecture-related domains
   const domainWeight = getDomainWeight(url);
   if (domainWeight > 0) {
     scores.architecture.weight += domainWeight;
-    scores.architecture.matches += 0; // Not a real match, just domain signal
+    scores.architecture.matches += 0;
   }
 
   let matchLog = [];
   let primaryServiceCategory = null;
   let primaryServiceKeyword = null;
   let servicesSummary = await extractServicesSummary(pages, geminiApiKey, url);
-  
-  // Verification: Ask Gemini to validate our findings (ONLY if we have real content)
+
+  // Portfolio signal aggregated across pages (mainly homepage)
+  const isPortfolioSite = !!(pages.homepage?.isPortfolioSite || pages.about?.isPortfolioSite || pages.services?.isPortfolioSite);
+
   let geminiVerification = null;
-  // Check if we have ANY meaningful content (even small amounts)
-  const totalContentLength = (pages.homepage?.length || 0) + 
-                            (pages.about?.length || 0) + 
-                            (pages.services?.length || 0);
-  if (totalContentLength > 150 && geminiApiKey) {
+  const totalContentLength =
+    (pages.homepage?.bodyText?.length || 0) +
+    (pages.about?.bodyText?.length || 0) +
+    (pages.services?.bodyText?.length || 0);
+
+  const totalMetaSchemaLength =
+    (pages.homepage?.metaDescription?.length || 0) +
+    (pages.about?.metaDescription?.length || 0) +
+    (pages.services?.metaDescription?.length || 0) +
+    (formatSchemaForPrompt(pages.homepage?.schemaData)?.length || 0);
+
+  const urlHasArchitectSignal = url.toLowerCase().includes('architect');
+
+  // Run verification if we have body content, meta/schema content, OR a strong domain signal
+  if ((totalContentLength > 150 || totalMetaSchemaLength > 30 || urlHasArchitectSignal) && geminiApiKey) {
     try {
-      geminiVerification = await verifyWithGemini(null, pages, url, geminiApiKey);
+      geminiVerification = await verifyWithGemini(pages, url, geminiApiKey);
     } catch (error) {
       console.error(`  ⚠️ Verification error:`, error.message);
       geminiVerification = null;
@@ -444,32 +640,37 @@ async function analyzeServiceFit(pages, company, url, geminiApiKey) {
 
   // Process each page with different weights
   const pageWeights = {
-    homepage: 1.0,      // Baseline
-    about: 2.5,         // About pages usually state primary service
-    services: 3.0,      // Services page is most authoritative for what they do
+    homepage: 1.0,
+    about: 2.5,
+    services: 3.0,
   };
 
-  Object.entries(pages).forEach(([pageType, text]) => {
-    if (!text) return;
+  Object.entries(pages).forEach(([pageType, pageData]) => {
+    if (!pageData) return;
 
-    const lowerText = text.toLowerCase();
+    // Combine body text with meta description and flattened schema text so
+    // keyword matching can pick up services that only appear in <head> data
+    const schemaFlatText = formatSchemaForPrompt(pageData.schemaData) || '';
+    const combinedText = [pageData.bodyText, pageData.metaTitle, pageData.metaDescription, schemaFlatText]
+      .filter(Boolean)
+      .join(' ');
+
+    if (!combinedText) return;
+
+    const lowerText = combinedText.toLowerCase();
     const pageWeight = pageWeights[pageType] || 1.0;
 
-    // Extract first 1000 chars (usually where primary service is mentioned)
-    const primarySection = text.substring(0, 1000).toLowerCase();
+    const primarySection = combinedText.substring(0, 1000).toLowerCase();
 
-    // Score each category
     Object.entries(KEYWORDS).forEach(([category, keywords]) => {
       keywords.forEach(keyword => {
         const regex = new RegExp(`\\b${keyword}\\b`, 'gi');
         const matches = lowerText.match(regex) || [];
-        
+
         if (matches.length > 0) {
-          // Position weighting: keywords in first 1000 chars get 3x multiplier
-          // This identifies what they emphasize as primary service
           const positionMultiplier = primarySection.includes(keyword.toLowerCase()) ? 3 : 1;
           const weight = matches.length * pageWeight * positionMultiplier;
-          
+
           scores[category].matches += matches.length;
           scores[category].weight += weight;
 
@@ -482,7 +683,6 @@ async function analyzeServiceFit(pages, company, url, geminiApiKey) {
             inPrimarySection: primarySection.includes(keyword.toLowerCase()),
           });
 
-          // Track highest scoring service in primary section (likely primary service)
           if (primarySection.includes(keyword.toLowerCase())) {
             if (!primaryServiceCategory || weight > scores[primaryServiceCategory].weight) {
               primaryServiceCategory = category;
@@ -494,10 +694,15 @@ async function analyzeServiceFit(pages, company, url, geminiApiKey) {
     });
   });
 
-  // Normalize weighted scores
   Object.keys(scores).forEach(key => {
     scores[key].weight = Math.round(scores[key].weight * 10) / 10;
   });
+
+  if (!primaryServiceCategory && scores.architecture.weight >= 25) {
+    primaryServiceCategory = 'architecture';
+    primaryServiceKeyword = 'domain-based (architect in URL)';
+    console.log(`  ℹ️  Domain weighting identified: architecture (from URL)`);
+  }
 
   // Determine recommendation based on PRIMARY service
   let recommendation = 'SKIP';
@@ -506,39 +711,57 @@ async function analyzeServiceFit(pages, company, url, geminiApiKey) {
   let targetCategoryMatch = null;
 
   const targetCategories = ['windowCoverings', 'homeAutomation', 'architecture', 'interiorDesign'];
-  
-  // If irrelevant keywords dominate, they're clearly not a fit
+
+  // Portfolio confidence boost: lower the weight bar needed for KEEP/high confidence
+  // when the site is confirmed portfolio-structure AND the domain also signals
+  // architecture/design. This stops penalizing sites for having images instead of text.
+  const portfolioBoostEligible = isPortfolioSite && domainWeight > 0;
+  const highThreshold = portfolioBoostEligible ? 15 : 25;
+  const mediumThreshold = portfolioBoostEligible ? 8 : 15;
+  const lowThreshold = portfolioBoostEligible ? 5 : 10;
+
   if (scores.irrelevant.weight > (scores.windowCoverings.weight + scores.homeAutomation.weight + scores.architecture.weight + scores.interiorDesign.weight)) {
     recommendation = 'SKIP';
     confidence = 'high';
     reasoning = `Primary service appears to be: ${primaryServiceKeyword || 'other'}. Not a fit for BCC (${primaryServiceCategory || 'irrelevant industry'}).`;
-  }
-  // If one of our 4 target categories clearly dominates
-  else if (primaryServiceCategory && targetCategories.includes(primaryServiceCategory)) {
+  } else if (primaryServiceCategory && targetCategories.includes(primaryServiceCategory)) {
     targetCategoryMatch = primaryServiceCategory;
-    
-    if (scores[primaryServiceCategory].weight >= 30) {
+
+    if (scores[primaryServiceCategory].weight >= highThreshold) {
       recommendation = 'KEEP';
       confidence = 'high';
       reasoning = `Primary service is ${primaryServiceCategory}: ${primaryServiceKeyword}. Strong fit for BCC.`;
-    } else if (scores[primaryServiceCategory].weight >= 15) {
+      if (portfolioBoostEligible) {
+        reasoning += ' (Portfolio-site confidence boost applied: image-heavy structure + architecture domain signal.)';
+      }
+    } else if (scores[primaryServiceCategory].weight >= mediumThreshold) {
       recommendation = 'KEEP';
       confidence = 'medium';
       reasoning = `Primary service appears to be ${primaryServiceCategory}: ${primaryServiceKeyword}. Good fit for BCC.`;
+      if (portfolioBoostEligible) {
+        reasoning += ' (Portfolio-site confidence boost applied.)';
+      }
+    } else if (scores[primaryServiceCategory].weight >= lowThreshold) {
+      recommendation = 'KEEP';
+      confidence = 'low';
+      reasoning = `Primary service might be ${primaryServiceCategory}: ${primaryServiceKeyword}. Potential fit for BCC.`;
     } else {
       recommendation = 'MAYBE';
       confidence = 'low';
       reasoning = `Offers ${primaryServiceCategory} services but signals are weak. Manual review recommended.`;
     }
-  }
-  // Ambiguous: signals are mixed or unclear
-  else if ((scores.windowCoverings.weight + scores.homeAutomation.weight + scores.architecture.weight + scores.interiorDesign.weight) > 5) {
+  } else if (isPortfolioSite && domainWeight > 0) {
+    // No keyword-based primary service found, but structure + domain strongly
+    // suggest architecture/design and text was simply too sparse to match keywords
+    recommendation = 'MAYBE';
+    confidence = 'medium';
+    targetCategoryMatch = 'architecture';
+    reasoning = `Portfolio-style site with minimal text; domain and structure suggest architecture/design. Manual review recommended (low text volume limited keyword matching).`;
+  } else if ((scores.windowCoverings.weight + scores.homeAutomation.weight + scores.architecture.weight + scores.interiorDesign.weight) > 5) {
     recommendation = 'MAYBE';
     confidence = 'medium';
     reasoning = `Services are unclear or mixed. Could be relevant. Manual review recommended.`;
-  }
-  // No strong signals either way
-  else {
+  } else {
     recommendation = 'SKIP';
     confidence = 'medium';
     reasoning = `No clear service match found. Does not appear to work with target categories.`;
@@ -552,6 +775,8 @@ async function analyzeServiceFit(pages, company, url, geminiApiKey) {
     servicesSummary,
     geminiVerification,
     reasoning,
+    isPortfolioSite,
+    portfolioBoostApplied: portfolioBoostEligible,
     scores: {
       windowCoverings: scores.windowCoverings.weight,
       homeAutomation: scores.homeAutomation.weight,
@@ -559,7 +784,7 @@ async function analyzeServiceFit(pages, company, url, geminiApiKey) {
       interiorDesign: scores.interiorDesign.weight,
       irrelevant: scores.irrelevant.weight,
     },
-    matchLog, // Full detail for understanding decisions
+    matchLog,
   };
 }
 
@@ -570,84 +795,79 @@ Actor.main(async () => {
   const input = await Actor.getInput();
   console.log('Input:', JSON.stringify(input, null, 2));
 
-  // Get URLs and Gemini API key from input
   const urls = input?.urls || [];
   const geminiApiKey = input?.geminiApiKey || process.env.GEMINI_API_KEY;
-  
+
   if (!Array.isArray(urls) || urls.length === 0) {
     throw new Error('No URLs provided. Input should contain "urls" array.');
   }
-  
+
   if (!geminiApiKey) {
     console.warn('⚠️  WARNING: No Gemini API key provided. Summaries will use fallback.');
   } else {
     console.log('✓ Gemini API key received - summaries will be generated');
   }
 
-  // Open datasets to push results
   const dataset = await Actor.openDataset('results');
   const detailDataset = await Actor.openDataset('detail-logs');
-  
-  // Clear existing data to avoid duplicates
+
   console.log('🧹 Clearing previous results...');
   await dataset.drop();
   await detailDataset.drop();
-  
-  // Recreate fresh datasets
+
   const freshDataset = await Actor.openDataset('results');
   const freshDetailDataset = await Actor.openDataset('detail-logs');
 
   let processedCount = 0;
 
-  // Process each URL
   for (let i = 0; i < urls.length; i++) {
     const url = urls[i];
     console.log(`\n[${i + 1}/${urls.length}] Processing: ${url}`);
 
     try {
-      // Fetch homepage
       console.log('  → Fetching homepage...');
-      const homepageText = await extractPageContent(url, 'homepage');
-      
-      if (!homepageText) {
+      const homepageData = await extractPageContent(url, 'homepage');
+
+      if (!homepageData) {
         console.warn('  ⚠️  Could not fetch homepage, will try about/services pages');
+      } else if (homepageData.isPortfolioSite) {
+        console.log(`  ℹ️  Portfolio-style structure detected (images: ${homepageData.imageCount}, ratio: ${homepageData.imageToTextRatio})`);
       }
 
-      // Intelligently fetch About Us page
-      let aboutText = null;
+      let aboutData = null;
       const aboutUrl = await fetchAboutPage(url);
       if (aboutUrl) {
         console.log(`  → Found About page, fetching: ${aboutUrl}`);
-        aboutText = await extractPageContent(aboutUrl, 'about');
+        aboutData = await extractPageContent(aboutUrl, 'about');
       } else {
         console.log('  → No About page found');
       }
 
-      // Intelligently fetch Services page
-      let servicesText = null;
+      let servicesData = null;
       const servicesUrl = await fetchServicesPage(url);
       if (servicesUrl) {
         console.log(`  → Found Services page, fetching: ${servicesUrl}`);
-        servicesText = await extractPageContent(servicesUrl, 'services');
+        servicesData = await extractPageContent(servicesUrl, 'services');
       } else {
         console.log('  → No Services page found');
       }
 
-      // Check if we have ANY content at all
       const pages = {
-        homepage: homepageText,
-        about: aboutText,
-        services: servicesText,
+        homepage: homepageData,
+        about: aboutData,
+        services: servicesData,
       };
-      
-      const hasAnyContent = homepageText || aboutText || servicesText;
+
+      const hasAnyContent =
+        homepageData?.bodyText || aboutData?.bodyText || servicesData?.bodyText ||
+        homepageData?.metaDescription || homepageData?.schemaData;
+
       if (!hasAnyContent) {
         throw new Error('Could not fetch any content from website');
       }
 
       const analysis = await analyzeServiceFit(pages, url.split('/')[2], url, geminiApiKey);
 
-      // Main result - columns for CSV
       const result = {
         url,
         status: 'success',
@@ -657,27 +877,35 @@ Actor.main(async () => {
         primaryServiceIdentified: analysis.primaryServiceIdentified,
         targetCategoryMatch: analysis.targetCategoryMatch,
         reasoning: analysis.reasoning,
+        isPortfolioSite: analysis.isPortfolioSite,
+        portfolioBoostApplied: analysis.portfolioBoostApplied,
         windowCoveringsScore: analysis.scores.windowCoverings,
         homeAutomationScore: analysis.scores.homeAutomation,
         architectureScore: analysis.scores.architecture,
         interiorDesignScore: analysis.scores.interiorDesign,
         irrelevantScore: analysis.scores.irrelevant,
         pagesAnalyzed: {
-          homepage: !!homepageText,
-          about: !!aboutText,
-          services: !!servicesText,
+          homepage: !!homepageData?.bodyText,
+          about: !!aboutData?.bodyText,
+          services: !!servicesData?.bodyText,
         },
+        metaTitleFound: !!homepageData?.metaTitle,
+        metaDescriptionFound: !!homepageData?.metaDescription,
+        schemaDataFound: !!homepageData?.schemaData,
         geminiVerification: analysis.geminiVerification || 'No verification performed',
         timestamp: new Date(),
       };
 
       await freshDataset.pushData(result);
 
-      // Detailed logs for iteration
       const detailLog = {
         url,
         recommendation: analysis.recommendation,
         primaryServiceIdentified: analysis.primaryServiceIdentified,
+        isPortfolioSite: analysis.isPortfolioSite,
+        homepageMetaTitle: homepageData?.metaTitle || null,
+        homepageMetaDescription: homepageData?.metaDescription || null,
+        homepageSchemaData: homepageData?.schemaData || null,
         matchDetails: analysis.matchLog,
         totalMatches: analysis.matchLog.length,
         geminiVerification: analysis.geminiVerification || 'No verification performed',
@@ -691,7 +919,7 @@ Actor.main(async () => {
 
     } catch (error) {
       console.error(`  ❌ Error: ${error.message}`);
-      
+
       await freshDataset.pushData({
         url,
         status: 'error',
@@ -700,7 +928,6 @@ Actor.main(async () => {
       });
     }
 
-    // Delay to avoid overwhelming servers
     await new Promise(resolve => setTimeout(resolve, 1500));
   }
 
