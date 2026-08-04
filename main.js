@@ -206,30 +206,30 @@ async function extractPageContent(url, pageType = 'homepage') {
  * Enhanced text cleaning - remove navigation, social media, junk content
  */
 function cleanPageText(text) {
-  if (!text) return '';
+  if (!text || text.length < 50) return '';
   
   let cleaned = text;
   
-  // Remove common navigation/menu items
-  cleaned = cleaned.replace(/\b(menu|nav|navigation|home|about|contact|services|portfolio|blog|news|resources|careers|search|skip to content|instagram|linkedin|twitter|facebook|youtube)\b/gi, '');
+  // Remove script and style tags content
+  // (Already done by cheerio in extractPageContent, but be safe)
   
-  // Remove social media links and emails
-  cleaned = cleaned.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '');
-  cleaned = cleaned.replace(/www\.[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '');
+  // Remove common nav/menu items (be less aggressive - only exact matches)
+  cleaned = cleaned.replace(/\b(menu|nav|navigation|instagram|linkedin|twitter|facebook|youtube|contact us|follow us)\b/gi, '');
   
   // Remove URLs
   cleaned = cleaned.replace(/https?:\/\/[^\s]+/g, '');
+  cleaned = cleaned.replace(/www\.[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '');
   
-  // Remove phone numbers
-  cleaned = cleaned.replace(/\(?[\d\s\-\.]+\)?/g, '');
+  // Remove emails
+  cleaned = cleaned.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '');
   
-  // Remove common UI text
-  cleaned = cleaned.replace(/\b(click here|read more|learn more|view|expand|show more|hide|toggle|open|close)\b/gi, '');
+  // Remove phone-like patterns (but not years)
+  cleaned = cleaned.replace(/\(?[0-9]{3}[-.]?[0-9]{3}[-.]?[0-9]{4}\)?/g, '');
   
   // Remove extra whitespace
   cleaned = cleaned.replace(/\s+/g, ' ').trim();
   
-  // Keep only first 1500 characters of cleaned text (good content usually early)
+  // Keep only first 1500 characters of cleaned text
   return cleaned.substring(0, 1500);
 }
 
@@ -237,17 +237,18 @@ function cleanPageText(text) {
  * Generate summary using Gemini API
  */
 async function generateGeminiSummary(cleanedText, geminiApiKey) {
-  if (!cleanedText || cleanedText.length < 50) {
+  if (!cleanedText || cleanedText.length < 30) {
+    console.log('    ⚠️  Cleaned text too short for Gemini, using fallback');
     return 'Unable to determine services';
   }
   
   if (!geminiApiKey) {
-    console.warn('⚠️  No Gemini API key provided - skipping Gemini summary');
+    console.log('    ⚠️  No Gemini API key - skipping summary');
     return 'Gemini API key not provided';
   }
   
   try {
-    console.log('✓ Calling Gemini API with model gemini-3.5-flash');
+    console.log('    → Calling Gemini for summary...');
     const genAI = new GoogleGenerativeAI(geminiApiKey);
     const model = genAI.getGenerativeModel({ model: 'gemini-3.5-flash' });
     
@@ -261,9 +262,9 @@ Summary (1-2 sentences only):`;
     const result = await model.generateContent(prompt);
     const responseText = result.response.text();
     
-    console.log('✓ Gemini response received');
+    console.log('    ✓ Gemini summary generated');
     
-    // Clean up response - remove quotes or extra formatting
+    // Clean up response
     let summary = responseText.trim();
     summary = summary.replace(/^["']|["']$/g, '');
     
@@ -274,8 +275,9 @@ Summary (1-2 sentences only):`;
     
     return summary;
   } catch (error) {
-    console.error('❌ Gemini API error:', error.message);
-    return `Error: ${error.message}`;
+    console.error('    ❌ Gemini summary error:', error.message);
+    // Return a marker string so we can see this happened
+    return `[Gemini Error: ${error.message.substring(0, 50)}]`;
   }
 }
 
@@ -323,12 +325,17 @@ async function verifyWithGemini(analysis, pages, url, geminiApiKey) {
   }
   
   try {
-    console.log(`  → Verification: Asking Gemini to confirm our analysis`);
+    console.log(`    → Calling Gemini for verification...`);
     const genAI = new GoogleGenerativeAI(geminiApiKey);
     const model = genAI.getGenerativeModel({ model: 'gemini-3.5-flash' });
     
     const textToAnalyze = pages.about || pages.services || pages.homepage || '';
     const cleanedText = cleanPageText(textToAnalyze).substring(0, 1000);
+    
+    if (!cleanedText || cleanedText.length < 20) {
+      console.log(`    ⚠️  Not enough content for verification`);
+      return null;
+    }
     
     const prompt = `Based on the following website text about a company, determine their PRIMARY service category. Choose ONE: 
     1. Window coverings/treatments
@@ -345,10 +352,10 @@ What is their PRIMARY service? Answer with just the category name and 1 sentence
     const result = await model.generateContent(prompt);
     const responseText = result.response.text();
     
-    console.log(`  ✓ Verification response: ${responseText.substring(0, 80)}...`);
+    console.log(`    ✓ Gemini verification complete`);
     return responseText.trim();
   } catch (error) {
-    console.error(`  ❌ Verification failed:`, error.message);
+    console.error(`    ❌ Verification error:`, error.message);
     return null;
   }
 }
@@ -420,10 +427,19 @@ async function analyzeServiceFit(pages, company, url, geminiApiKey) {
   let primaryServiceKeyword = null;
   let servicesSummary = await extractServicesSummary(pages, geminiApiKey, url);
   
-  // Verification: Ask Gemini to validate our findings
+  // Verification: Ask Gemini to validate our findings (ONLY if we have real content)
   let geminiVerification = null;
-  if (pages.homepage || pages.about || pages.services) {
-    geminiVerification = await verifyWithGemini(null, pages, url, geminiApiKey);
+  // Check if we have ANY meaningful content (even small amounts)
+  const totalContentLength = (pages.homepage?.length || 0) + 
+                            (pages.about?.length || 0) + 
+                            (pages.services?.length || 0);
+  if (totalContentLength > 150 && geminiApiKey) {
+    try {
+      geminiVerification = await verifyWithGemini(null, pages, url, geminiApiKey);
+    } catch (error) {
+      console.error(`  ⚠️ Verification error:`, error.message);
+      geminiVerification = null;
+    }
   }
 
   // Process each page with different weights
@@ -571,6 +587,15 @@ Actor.main(async () => {
   // Open datasets to push results
   const dataset = await Actor.openDataset('results');
   const detailDataset = await Actor.openDataset('detail-logs');
+  
+  // Clear existing data to avoid duplicates
+  console.log('🧹 Clearing previous results...');
+  await dataset.drop();
+  await detailDataset.drop();
+  
+  // Recreate fresh datasets
+  const freshDataset = await Actor.openDataset('results');
+  const freshDetailDataset = await Actor.openDataset('detail-logs');
 
   let processedCount = 0;
 
@@ -646,7 +671,7 @@ Actor.main(async () => {
         timestamp: new Date(),
       };
 
-      await dataset.pushData(result);
+      await freshDataset.pushData(result);
 
       // Detailed logs for iteration
       const detailLog = {
@@ -659,7 +684,7 @@ Actor.main(async () => {
         timestamp: new Date(),
       };
 
-      await detailDataset.pushData(detailLog);
+      await freshDetailDataset.pushData(detailLog);
 
       processedCount++;
       console.log(`  ✅ ${analysis.recommendation}`);
@@ -667,7 +692,7 @@ Actor.main(async () => {
     } catch (error) {
       console.error(`  ❌ Error: ${error.message}`);
       
-      await dataset.pushData({
+      await freshDataset.pushData({
         url,
         status: 'error',
         error: error.message,
