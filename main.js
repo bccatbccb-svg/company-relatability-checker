@@ -485,6 +485,27 @@ What is their PRIMARY service? Answer with just the category name and 1 sentence
 }
 
 /**
+ * Parse Gemini's verification response to figure out which target category
+ * (if any) it named. The verification prompt asks Gemini to lead with the
+ * category name, so we match against the first line only — this avoids
+ * false-positive matches from category names mentioned later while
+ * explaining why something DOESN'T fit.
+ */
+function parseGeminiCategory(geminiVerification) {
+  if (!geminiVerification) return null;
+
+  const firstLine = geminiVerification.split('\n')[0].toLowerCase();
+
+  if (firstLine.includes('none of the above')) return null;
+  if (firstLine.includes('window covering') || firstLine.includes('window treatment')) return 'windowCoverings';
+  if (firstLine.includes('home automation') || firstLine.includes('smart home')) return 'homeAutomation';
+  if (firstLine.includes('interior design')) return 'interiorDesign';
+  if (firstLine.includes('architecture')) return 'architecture';
+
+  return null;
+}
+
+/**
  * Verification: Ask Gemini to validate our keyword findings
  */
 async function verifyWithGemini(pages, url, geminiApiKey) {
@@ -766,6 +787,36 @@ async function analyzeServiceFit(pages, company, url, geminiApiKey) {
     confidence = 'medium';
     reasoning = `No clear service match found. Does not appear to work with target categories.`;
   }
+
+  // --- Gemini thin-keyword override -----------------------------------
+  // When on-page keyword evidence is thin, let Gemini's independent read
+  // break the tie IF it agrees on a target category. This only fires on
+  // the two "weak signal" branches above — it does NOT touch the
+  // irrelevant-dominant SKIP branch, since that reflects a real keyword
+  // conflict (e.g. heavy "engineering" language), not thin evidence, and
+  // Gemini already gets a chance to override that case on its own by
+  // returning "None of the above" for a true irrelevant match.
+  const geminiCategory = parseGeminiCategory(geminiVerification);
+  const isThinKeywordMaybe = recommendation === 'MAYBE' && reasoning.startsWith('Offers');
+  const isThinKeywordSkip = recommendation === 'SKIP' && reasoning.startsWith('No clear service match found');
+
+  if (geminiCategory && isThinKeywordMaybe && geminiCategory === primaryServiceCategory) {
+    // Keyword signal already pointed at this category, just too weak to KEEP on its own.
+    // Gemini independently confirming the same category is enough to upgrade to KEEP.
+    recommendation = 'KEEP';
+    confidence = 'low';
+    targetCategoryMatch = geminiCategory;
+    reasoning = `Primary service is ${geminiCategory}: ${primaryServiceKeyword}. On-page keyword signal was weak, but Gemini verification independently confirmed ${geminiCategory}. Upgraded from MAYBE (low confidence — recommend spot-checking).`;
+  } else if (geminiCategory && isThinKeywordSkip) {
+    // No keyword-based category identified at all, but Gemini found one from
+    // meta/schema/portfolio signals. Upgrade one tier (not straight to KEEP,
+    // since there's zero keyword corroboration here) so it surfaces for review.
+    recommendation = 'MAYBE';
+    confidence = 'low';
+    targetCategoryMatch = geminiCategory;
+    reasoning = `No on-page keyword match found, but Gemini verification independently identified ${geminiCategory} as the primary service. Upgraded from SKIP for manual review.`;
+  }
+  // ----------------------------------------------------------------------
 
   return {
     recommendation,
