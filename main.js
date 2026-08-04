@@ -264,6 +264,24 @@ function detectPortfolioSignals($, textLength) {
 }
 
 /**
+ * Turn an axios error into a short, useful diagnostic string instead of a
+ * generic message — distinguishes timeouts, DNS failures, connection resets,
+ * and HTTP error status codes (403/404/500 etc.) from each other.
+ */
+function describeFetchError(error) {
+  if (error.response) {
+    return `HTTP ${error.response.status}`;
+  }
+  if (error.code === 'ECONNABORTED') {
+    return 'timeout';
+  }
+  if (error.code) {
+    return error.code; // e.g. ENOTFOUND, ECONNRESET, ECONNREFUSED
+  }
+  return error.message || 'unknown error';
+}
+
+/**
  * Extract text + metadata from webpage with better section detection
  * Depth: 3500-4000 characters per page
  *
@@ -300,8 +318,19 @@ async function extractPageContent(url, pageType = 'homepage') {
       fetchError: null,
     };
   } catch (error) {
-    console.error(`Error fetching ${url}: ${error.message}`);
-    return null;
+    const reason = describeFetchError(error);
+    console.error(`Error fetching ${url} (${pageType}): ${reason}`);
+    return {
+      bodyText: null,
+      metaTitle: null,
+      metaDescription: null,
+      schemaData: null,
+      imageCount: 0,
+      galleryElements: 0,
+      imageToTextRatio: 0,
+      isPortfolioSite: false,
+      fetchError: reason,
+    };
   }
 }
 
@@ -879,8 +908,8 @@ Actor.main(async () => {
       console.log('  → Fetching homepage...');
       const homepageData = await extractPageContent(url, 'homepage');
 
-      if (!homepageData) {
-        console.warn('  ⚠️  Could not fetch homepage, will try about/services pages');
+      if (homepageData.fetchError) {
+        console.warn(`  ⚠️  Could not fetch homepage (${homepageData.fetchError}), will try about/services pages`);
       } else if (homepageData.isPortfolioSite) {
         console.log(`  ℹ️  Portfolio-style structure detected (images: ${homepageData.imageCount}, ratio: ${homepageData.imageToTextRatio})`);
       }
@@ -914,7 +943,14 @@ Actor.main(async () => {
         homepageData?.metaDescription || homepageData?.schemaData;
 
       if (!hasAnyContent) {
-        throw new Error('Could not fetch any content from website');
+        // Build a specific reason per page instead of a generic message, so
+        // the output tells us WHY (timeout, DNS failure, HTTP 403/404/500,
+        // or simply no page found at that URL pattern) rather than just THAT.
+        const reasons = [];
+        reasons.push(`homepage: ${homepageData.fetchError || 'fetched but empty (no text/meta/schema found)'}`);
+        reasons.push(aboutUrl ? `about: ${aboutData?.fetchError || 'fetched but empty'}` : 'about: no about page found');
+        reasons.push(servicesUrl ? `services: ${servicesData?.fetchError || 'fetched but empty'}` : 'services: no services page found');
+        throw new Error(`Could not fetch any content from website (${reasons.join('; ')})`);
       }
 
       const analysis = await analyzeServiceFit(pages, url.split('/')[2], url, geminiApiKey);
